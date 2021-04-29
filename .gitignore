@@ -1,3 +1,4 @@
 sfu-ws/cert.pem
 sfu-ws/key.pem
 go.sum
+vendor

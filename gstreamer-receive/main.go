@@ -57,7 +57,6 @@ func gstreamerReceiveMain() {
 			if readErr != nil {
 				panic(err)
 			}
-
 			pipeline.Push(buf[:i])
 		}
 	})

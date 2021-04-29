@@ -12,6 +12,12 @@
 		"type": "browser"
 	},
 	{
+		"title": "Gstreamer Reflect",
+		"link": "gstreamer-reflect",
+		"description": "The gstreamer-reflect example shows how to receive media from the browser and play it live. This example uses GStreamer for rendering.",
+		"type": "browser"
+	},
+	{
 		"title": "Gstreamer Send",
 		"link": "gstreamer-send",
 		"description": "Example gstreamer-send shows how to send video to your browser. This example uses GStreamer to process the video.",
