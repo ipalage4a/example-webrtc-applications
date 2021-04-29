@@ -197,12 +197,6 @@ func gstreamerReceiveMain() {
 	select {}
 }
 
-func init() {
-	// This example uses Gstreamer's autovideosink element to display the received video
-	// This element, along with some others, sometimes require that the process' main thread is used
-	// runtime.LockOSThread()
-}
-
 func main() {
 	// Start a new thread to do the actual work for this application
 	go func() {
