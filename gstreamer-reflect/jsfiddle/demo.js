@@ -12,7 +12,7 @@ let log = msg => {
 }
 
 
-navigator.mediaDevices.getUserMedia({ video: false, audio: true })
+navigator.mediaDevices.getUserMedia({ video: fasle, audio: true })
   .then(stream => {
 
     stream.getTracks().forEach(function (track) {
@@ -24,8 +24,6 @@ navigator.mediaDevices.getUserMedia({ video: false, audio: true })
 
       document.getElementById('local').appendChild(el)
     });
-
-    // displayVideo(stream)
 
 
     pc.createOffer().then(d => pc.setLocalDescription(d)).catch(log)
@@ -66,7 +64,13 @@ window.addDisplayCapture = () => {
     document.getElementById('displayCapture').disabled = true
 
     stream.getTracks().forEach(function (track) {
-      pc.addTrack(track, displayVideo(stream));
+      pc.addTrack(track, stream);
+      var el = document.createElement(track.kind)
+      el.srcObject = stream
+      el.autoplay = true
+      el.controls = true
+
+      document.getElementById('local').appendChild(el)
     });
 
     pc.createOffer().then(d => pc.setLocalDescription(d)).catch(log)

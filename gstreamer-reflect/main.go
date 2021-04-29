@@ -10,16 +10,13 @@ import (
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 
-	// gstSink "github.com/pion/example-webrtc-applications/v3/internal/gstreamer-sink"
-	// gstSrc "github.com/pion/example-webrtc-applications/v3/internal/gstreamer-src"
-
 	"github.com/notedit/gst"
 
 	"github.com/pion/example-webrtc-applications/v3/internal/signal"
 )
 
 var peerConnection *webrtc.PeerConnection
-var track, videoTrack *webrtc.TrackLocalStaticSample
+var track *webrtc.TrackLocalStaticSample
 
 var pipeline *gst.Pipeline
 
@@ -62,22 +59,21 @@ func gstreamerReceiveMain() {
 		panic(err)
 	}
 
-	trackName := "video"
+	trackName := "audio"
 	codecName := "opus"
 
 	pipelineStr := "appsrc format=time is-live=true do-timestamp=true name=" + trackName + "-src ! application/x-rtp"
 	switch strings.ToLower(codecName) {
 	case "vp8":
-		pipelineStr += ", encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay"
+		pipelineStr += ", encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay ! decodebin"
 	case "opus":
-		// pipelineStr += ", payload=96, encoding-name=OPUS ! rtb"
-		pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay"
+		pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! decodebin"
 	case "vp9":
-		pipelineStr += " ! rtpvp9depay"
+		pipelineStr += " ! rtpvp9depay ! decodebin"
 	case "h264":
-		pipelineStr += " ! rtph264depay"
+		pipelineStr += " ! rtph264depay ! decodebin"
 	case "g722":
-		pipelineStr += " clock-rate=8000 ! rtpg722depay"
+		pipelineStr += " clock-rate=8000 ! rtpg722depay ! decodebin"
 	default:
 		panic("Unhandled codec " + codecName)
 	}
@@ -88,8 +84,7 @@ func gstreamerReceiveMain() {
 
 	switch strings.ToLower(codecName) {
 	case "vp8":
-		// pipelineStr += " ! vp8enc error-resilient=partitions keyframe-max-dist=10 auto-alt-ref=true cpu-used=5 deadline=1 ! " + pipelineStrSink
-		pipelineStr += " ! video/x-vp8 ! " + pipelineStrSink
+		pipelineStr += " ! vp8enc ! video/x-vp8 ! " + pipelineStrSink
 		clockRate = videoClockRate
 
 	case "vp9":
@@ -101,9 +96,7 @@ func gstreamerReceiveMain() {
 		clockRate = videoClockRate
 
 	case "opus":
-		// pipelineStr += " ! opusdec !" + pipelineStrSink
-		// pipelineStr += " ! audio/x-opus, channel-mapping-family=0 !" + pipelineStrSink
-		pipelineStr += " ! audio/x-opus, channel-mapping-family=0 ! opusdec !" + pipelineStrSink
+		pipelineStr += " ! opusenc ! audio/x-opus ! " + pipelineStrSink
 		clockRate = audioClockRate
 
 	case "g722":
@@ -121,8 +114,8 @@ func gstreamerReceiveMain() {
 	default:
 		panic("Unhandled codec " + codecName)
 	}
-	log.Println(pipelineStr)
 
+	log.Println(pipelineStr)
 	log.Println(clockRate)
 	pipeline, err = gst.ParseLaunch(pipelineStr)
 
@@ -133,19 +126,8 @@ func gstreamerReceiveMain() {
 
 	appsrc := pipeline.GetByName(trackName + "-src")
 
-	// // Create a video track
-	// videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// _, err = peerConnection.AddTrack(videoTrack)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
 	// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
 	// for the given codec
-
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
 		go func() {
@@ -222,9 +204,11 @@ func init() {
 }
 
 func main() {
-	// go gstSend()
 	// Start a new thread to do the actual work for this application
 	go func() {
+		var lenData int
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-receiveDone:
@@ -234,11 +218,15 @@ func main() {
 					if err != nil {
 						panic(err)
 					}
+
+					lenData = len(out.Data)
+
 					if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
 						panic(err)
 					}
-					fmt.Println("pull ", len(out.Data))
 				}
+			case <-ticker.C:
+				fmt.Println("pull ", lenData)
 			default:
 			}
 		}
@@ -246,8 +234,4 @@ func main() {
 	go gstreamerReceiveMain()
 
 	select {}
-
-	// Use this goroutine (which has been runtime.LockOSThread'd to he the main thread) to run the Glib loop that Gstreamer requires
-	// gstSink.StartMainLoop()
-
 }
