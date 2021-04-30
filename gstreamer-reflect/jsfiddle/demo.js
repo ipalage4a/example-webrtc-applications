@@ -12,14 +12,14 @@ let log = msg => {
 }
 
 
-navigator.mediaDevices.getUserMedia({ video: fasle, audio: true })
+navigator.mediaDevices.getUserMedia({ video: false, audio: true })
   .then(stream => {
 
     stream.getTracks().forEach(function (track) {
       pc.addTrack(track, stream);
       var el = document.createElement(track.kind)
       el.srcObject = stream
-      el.autoplay = true
+      el.autoplay = false
       el.controls = true
 
       document.getElementById('local').appendChild(el)

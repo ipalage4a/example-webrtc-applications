@@ -1,16 +1,15 @@
 package main
 
 import (
+	"C"
 	"fmt"
-	"log"
-	"strings"
 	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 
-	"github.com/notedit/gst"
+	"github.com/ipalage4a/gst"
 
 	"github.com/pion/example-webrtc-applications/v3/internal/signal"
 )
@@ -19,6 +18,7 @@ var peerConnection *webrtc.PeerConnection
 var track *webrtc.TrackLocalStaticSample
 
 var pipeline *gst.Pipeline
+var src, sink *gst.Element
 
 var receiveDone chan struct{} = make(chan struct{}, 2)
 
@@ -27,6 +27,53 @@ const (
 	audioClockRate = 48000
 	pcmClockRate   = 8000
 )
+
+func createSrc(pipeline *gst.Pipeline) (src *gst.Element, err error) {
+
+	src, err = gst.ElementFactoryMake("appsrc", "input")
+	if err != nil {
+		return
+	}
+	src.SetObject("format", int(gst.FormatTime))
+	src.SetObject("is-live", true)
+	src.SetObject("do-timestamp", true)
+
+	rtp_to_opus, err := gst.ElementFactoryMake("rtpopusdepay", "")
+	if err != nil {
+		return
+	}
+	raw, err := gst.ElementFactoryMake("opusdecode", "")
+	if err != nil {
+		return
+	}
+
+	pipeline.AddMany(src, rtp_to_opus, raw)
+
+	xrtp := gst.CapsFromString("application/x-rtp, encoding-name=VP8-DRAFT-IETF-01")
+	src.LinkFiltered(rtp_to_opus, xrtp)
+	rtp_to_opus.Link(raw)
+
+	return
+}
+
+func createSink(pipeline *gst.Pipeline) (sink *gst.Element, err error) {
+	opusEnc, err := gst.ElementFactoryMake("opusenc", "")
+	xOpus := gst.CapsFromString("audio/x-opus")
+	if err != nil {
+		return
+	}
+
+	sink, err = gst.ElementFactoryMake("appsink", "output")
+	if err != nil {
+		return
+	}
+
+	pipeline.AddMany(sink, opusEnc)
+
+	opusEnc.LinkFiltered(sink, xOpus)
+	opusEnc.Link(sink)
+	return
+}
 
 // gstreamerReceiveMain is launched in a goroutine because the main thread is needed
 // for Glib's main loop (Gstreamer uses Glib)
@@ -59,72 +106,84 @@ func gstreamerReceiveMain() {
 		panic(err)
 	}
 
-	trackName := "audio"
-	codecName := "opus"
-
-	pipelineStr := "appsrc format=time is-live=true do-timestamp=true name=" + trackName + "-src ! application/x-rtp"
-	switch strings.ToLower(codecName) {
-	case "vp8":
-		pipelineStr += ", encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay ! decodebin"
-	case "opus":
-		pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! decodebin"
-	case "vp9":
-		pipelineStr += " ! rtpvp9depay ! decodebin"
-	case "h264":
-		pipelineStr += " ! rtph264depay ! decodebin"
-	case "g722":
-		pipelineStr += " clock-rate=8000 ! rtpg722depay ! decodebin"
-	default:
-		panic("Unhandled codec " + codecName)
+	// trackName := "audio"
+	pipeline, err = gst.PipelineNew("")
+	if err != nil {
+		return
 	}
 
-	pipelineStrSink := "appsink name=" + trackName + "-sink"
-
-	var clockRate float32
-
-	switch strings.ToLower(codecName) {
-	case "vp8":
-		pipelineStr += " ! vp8enc ! video/x-vp8 ! " + pipelineStrSink
-		clockRate = videoClockRate
-
-	case "vp9":
-		pipelineStr += " ! vp9enc ! " + pipelineStrSink
-		clockRate = videoClockRate
-
-	case "h264":
-		pipelineStr += " ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=20 ! video/x-h264,stream-format=byte-stream ! " + pipelineStrSink
-		clockRate = videoClockRate
-
-	case "opus":
-		pipelineStr += " ! opusenc ! audio/x-opus ! " + pipelineStrSink
-		clockRate = audioClockRate
-
-	case "g722":
-		pipelineStr += " ! avenc_g722 ! " + pipelineStrSink
-		clockRate = audioClockRate
-
-	case "pcmu":
-		pipelineStr += " ! audio/x-raw, rate=8000 ! mulawenc ! " + pipelineStrSink
-		clockRate = pcmClockRate
-
-	case "pcma":
-		pipelineStr += " ! audio/x-raw, rate=8000 ! alawenc ! " + pipelineStrSink
-		clockRate = pcmClockRate
-
-	default:
-		panic("Unhandled codec " + codecName)
-	}
-
-	log.Println(pipelineStr)
-	log.Println(clockRate)
-	pipeline, err = gst.ParseLaunch(pipelineStr)
-
+	src, err = createSrc(pipeline)
+	sink, err = createSink(pipeline)
 	if err != nil {
 		panic(err)
 	}
-	pipeline.SetState(gst.StatePlaying)
 
-	appsrc := pipeline.GetByName(trackName + "-src")
+	// codecName := "opus"
+
+	// pipelineStr := "appsrc format=time is-live=true do-timestamp=true name=input ! application/x-rtp"
+
+	// switch strings.ToLower(codecName) {
+	// case "vp8":
+	// 	pipelineStr += ", encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay ! decodebin"
+	// case "opus":
+	// 	pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! decodebin"
+	// case "vp9":
+	// 	pipelineStr += " ! rtpvp9depay ! decodebin"
+	// case "h264":
+	// 	pipelineStr += " ! rtph264depay ! decodebin"
+	// case "g722":
+	// 	pipelineStr += " clock-rate=8000 ! rtpg722depay ! decodebin"
+	// default:
+	// 	panic("Unhandled codec " + codecName)
+	// }
+
+	// pipelineStrSink := "appsink name=output"
+
+	// var clockRate float32
+
+	// switch strings.ToLower(codecName) {
+	// case "vp8":
+	// 	pipelineStr += " ! vp8enc ! video/x-vp8 ! " + pipelineStrSink
+	// 	clockRate = videoClockRate
+
+	// case "vp9":
+	// 	pipelineStr += " ! vp9enc ! " + pipelineStrSink
+	// 	clockRate = videoClockRate
+
+	// case "h264":
+	// 	pipelineStr += " ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=20 ! video/x-h264,stream-format=byte-stream ! " + pipelineStrSink
+	// 	clockRate = videoClockRate
+
+	// case "opus":
+	// 	pipelineStr += " ! opusenc ! audio/x-opus ! " + pipelineStrSink
+	// 	clockRate = audioClockRate
+
+	// case "g722":
+	// 	pipelineStr += " ! avenc_g722 ! " + pipelineStrSink
+	// 	clockRate = audioClockRate
+
+	// case "pcmu":
+	// 	pipelineStr += " ! audio/x-raw, rate=8000 ! mulawenc ! " + pipelineStrSink
+	// 	clockRate = pcmClockRate
+
+	// case "pcma":
+	// 	pipelineStr += " ! audio/x-raw, rate=8000 ! alawenc ! " + pipelineStrSink
+	// 	clockRate = pcmClockRate
+
+	// default:
+	// 	panic("Unhandled codec " + codecName)
+	// }
+
+	// log.Println(pipelineStr)
+	// log.Println(clockRate)
+	// pipeline, err = gst.ParseLaunch(pipelineStr)
+
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// pipeline.SetState(gst.StatePlaying)
+
+	// src = pipeline.GetByName("input")
 
 	// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
 	// for the given codec
@@ -140,16 +199,21 @@ func gstreamerReceiveMain() {
 			}
 		}()
 
-		receiveDone <- struct{}{}
-
 		buf := make([]byte, 1400)
+		var i int
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
 		for {
-			i, _, readErr := track.Read(buf)
-			if readErr != nil {
-				panic(err)
+			select {
+			case <-ticker.C:
+				fmt.Println("push ", len(buf[:i]))
+			default:
+				i, _, err = track.Read(buf)
+				if err != nil {
+					panic(err)
+				}
+				err = src.PushBuffer(buf[:i])
 			}
-
-			err = appsrc.PushBuffer(buf[:i])
 		}
 	})
 
@@ -203,25 +267,26 @@ func main() {
 		var lenData int
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-receiveDone:
-				appsink := pipeline.GetByName("video-sink")
-				for {
-					out, err := appsink.PullSample()
-					if err != nil {
-						panic(err)
-					}
 
-					lenData = len(out.Data)
-
-					if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
-						panic(err)
-					}
-				}
-			case <-ticker.C:
+		go func() {
+			for range ticker.C {
 				fmt.Println("pull ", lenData)
-			default:
+			}
+		}()
+
+		for {
+			if sink == nil {
+				continue
+			}
+			out, err := sink.PullSample()
+			if err != nil {
+				continue
+			}
+
+			lenData = len(out.Data)
+
+			if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
+				panic(err)
 			}
 		}
 	}()
