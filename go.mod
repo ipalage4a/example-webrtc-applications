@@ -6,7 +6,7 @@ require (
 	github.com/at-wat/ebml-go v0.16.0
 	github.com/google/uuid v1.2.0
 	github.com/gorilla/websocket v1.4.2
-	github.com/ipalage4a/gst v0.0.10
+	github.com/ipalage4a/gst v0.0.13
 	github.com/notedit/janus-go v0.0.0-20210115013133-fdce1b146d0e
 	github.com/pion/rtcp v1.2.6
 	github.com/pion/rtp v1.6.5

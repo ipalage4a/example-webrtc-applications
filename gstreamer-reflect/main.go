@@ -25,13 +25,12 @@ var lastSrcElem, firstSinkElem *gst.Element
 
 var receiveDone chan struct{} = make(chan struct{}, 2)
 
-const (
-	videoClockRate = 90000
-	audioClockRate = 48000
-	pcmClockRate   = 8000
-)
+func initPipeline() (err error) {
 
-func createSrc(pipeline *gst.Pipeline) (src *gst.Element, err error) {
+	pipeline, err = gst.PipelineNew("test")
+	if err != nil {
+		return
+	}
 
 	src, err = gst.ElementFactoryMake("appsrc", "input")
 	if err != nil {
@@ -48,23 +47,11 @@ func createSrc(pipeline *gst.Pipeline) (src *gst.Element, err error) {
 		return
 	}
 
-	bin, err := gst.ElementFactoryMake("decodebin", "")
+	bin, err := gst.ElementFactoryMake("opusdec", "")
 	if err != nil {
 		return
 	}
 
-	pipeline.AddMany(src, rtp_to_opus, bin)
-
-	src.LinkFiltered(rtp_to_opus, xrtp)
-
-	rtp_to_opus.Link(bin)
-
-	lastSrcElem = bin
-
-	return
-}
-
-func createSink(pipeline *gst.Pipeline) (sink *gst.Element, err error) {
 	opusEnc, err := gst.ElementFactoryMake("opusenc", "")
 
 	xOpus := gst.CapsFromString("audio/x-opus")
@@ -77,13 +64,16 @@ func createSink(pipeline *gst.Pipeline) (sink *gst.Element, err error) {
 		return
 	}
 
-	pipeline.AddMany(opusEnc, sink)
+	pipeline.AddMany(src, rtp_to_opus, bin, opusEnc, sink)
 
-	firstSinkElem = opusEnc
-	lastSrcElem.Link(firstSinkElem)
+	src.LinkFiltered(rtp_to_opus, xrtp)
+	rtp_to_opus.Link(bin)
+
+	bin.Link(opusEnc)
+
+	rtp_to_opus.LinkFiltered(sink, xOpus)
 
 	opusEnc.LinkFiltered(sink, xOpus)
-	// opusEnc.Link(sink)
 
 	return
 }
@@ -92,6 +82,8 @@ func createSink(pipeline *gst.Pipeline) (sink *gst.Element, err error) {
 // for Glib's main loop (Gstreamer uses Glib)
 func gstreamerReceiveMain() {
 	// Everything below is the pion-WebRTC API! Thanks for using it ❤️.
+
+	sdpChan := signal.HTTPSDPServer()
 
 	// Prepare the configuration
 	config := webrtc.Configuration{
@@ -120,24 +112,12 @@ func gstreamerReceiveMain() {
 	}
 
 	// trackName := "audio"
-	pipeline, err = gst.PipelineNew("test")
-	if err != nil {
-		return
-	}
 
-	src, err = createSrc(pipeline)
-	if err != nil {
-		panic(err)
-	}
-
-	sink, err = createSink(pipeline)
-	if err != nil {
-		panic(err)
-	}
+	err = initPipeline()
 
 	// pipelineStr := "appsrc format=time is-live=true do-timestamp=true name=input ! application/x-rtp"
 
-	// pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! decodebin"
+	// pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! opusdec"
 
 	// pipelineStrSink := "appsink name=output"
 
@@ -145,12 +125,12 @@ func gstreamerReceiveMain() {
 
 	// pipeline, err = gst.ParseLaunch(pipelineStr)
 
-	// if err != nil {
-	// 	panic(err)
-	// }
+	if err != nil {
+		panic(err)
+	}
 
-	// src = pipeline.GetByName("input")
-	// sink = pipeline.GetByName("output")
+	src = pipeline.GetByName("input")
+	sink = pipeline.GetByName("output")
 
 	// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
 	// for the given codec
@@ -171,24 +151,15 @@ func gstreamerReceiveMain() {
 
 		buf := make([]byte, 1400)
 		var i int
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
+
 		for {
-			select {
-			case <-ticker.C:
-				if err != nil {
-					fmt.Errorf("push error: %v", err)
-				} else {
-					fmt.Println("push ", len(buf[:i]))
-				}
-			default:
-				i, _, err = track.Read(buf)
-				if err != nil {
-					panic(err)
-				}
-				err = src.PushBuffer(buf[:i])
-				receiveDone <- struct{}{}
+
+			i, _, err = track.Read(buf)
+			if err != nil {
+				panic(err)
 			}
+			err = src.PushBuffer(buf[:i])
+			fmt.Println("push ", len(buf[:i]))
 		}
 
 	})
@@ -202,7 +173,8 @@ func gstreamerReceiveMain() {
 	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
 
-	signal.Decode(<-signal.HTTPSDPServer(), &offer)
+	// signal.Decode(signal.MustReadStdin(), &offer)
+	signal.Decode(<-sdpChan, &offer)
 
 	// Set the remote SessionDescription
 	err = peerConnection.SetRemoteDescription(offer)
@@ -257,26 +229,22 @@ func main() {
 		}()
 
 		for {
-			select {
-			case <-receiveDone:
-				for {
-					if sink == nil {
-						continue
-					}
+			if sink == nil {
+				continue
+			}
 
-					out, err = sink.PullSample()
-					if err != nil {
-						continue
-					}
-					debug = out
+			out, err = sink.PullSample()
+			if err != nil {
+				continue
+			}
+			debug = out
 
-					if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
-						panic(err)
-					}
-				}
+			if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
+				panic(err)
 			}
 		}
 	}()
+
 	go gstreamerReceiveMain()
 
 	select {}
