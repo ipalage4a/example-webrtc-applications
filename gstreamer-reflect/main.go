@@ -18,7 +18,10 @@ var peerConnection *webrtc.PeerConnection
 var track *webrtc.TrackLocalStaticSample
 
 var pipeline *gst.Pipeline
+
 var src, sink *gst.Element
+
+var lastSrcElem, firstSinkElem *gst.Element
 
 var receiveDone chan struct{} = make(chan struct{}, 2)
 
@@ -38,26 +41,32 @@ func createSrc(pipeline *gst.Pipeline) (src *gst.Element, err error) {
 	src.SetObject("is-live", true)
 	src.SetObject("do-timestamp", true)
 
+	xrtp := gst.CapsFromString("application/x-rtp, payload=96, encoding-name=OPUS")
+
 	rtp_to_opus, err := gst.ElementFactoryMake("rtpopusdepay", "")
 	if err != nil {
 		return
 	}
-	raw, err := gst.ElementFactoryMake("opusdecode", "")
+
+	bin, err := gst.ElementFactoryMake("decodebin", "")
 	if err != nil {
 		return
 	}
 
-	pipeline.AddMany(src, rtp_to_opus, raw)
+	pipeline.AddMany(src, rtp_to_opus, bin)
 
-	xrtp := gst.CapsFromString("application/x-rtp, encoding-name=VP8-DRAFT-IETF-01")
 	src.LinkFiltered(rtp_to_opus, xrtp)
-	rtp_to_opus.Link(raw)
+
+	rtp_to_opus.Link(bin)
+
+	lastSrcElem = bin
 
 	return
 }
 
 func createSink(pipeline *gst.Pipeline) (sink *gst.Element, err error) {
 	opusEnc, err := gst.ElementFactoryMake("opusenc", "")
+
 	xOpus := gst.CapsFromString("audio/x-opus")
 	if err != nil {
 		return
@@ -68,10 +77,14 @@ func createSink(pipeline *gst.Pipeline) (sink *gst.Element, err error) {
 		return
 	}
 
-	pipeline.AddMany(sink, opusEnc)
+	pipeline.AddMany(opusEnc, sink)
+
+	firstSinkElem = opusEnc
+	lastSrcElem.Link(firstSinkElem)
 
 	opusEnc.LinkFiltered(sink, xOpus)
-	opusEnc.Link(sink)
+	// opusEnc.Link(sink)
+
 	return
 }
 
@@ -107,86 +120,43 @@ func gstreamerReceiveMain() {
 	}
 
 	// trackName := "audio"
-	pipeline, err = gst.PipelineNew("")
+	pipeline, err = gst.PipelineNew("test")
 	if err != nil {
 		return
 	}
 
 	src, err = createSrc(pipeline)
+	if err != nil {
+		panic(err)
+	}
+
 	sink, err = createSink(pipeline)
 	if err != nil {
 		panic(err)
 	}
 
-	// codecName := "opus"
-
 	// pipelineStr := "appsrc format=time is-live=true do-timestamp=true name=input ! application/x-rtp"
 
-	// switch strings.ToLower(codecName) {
-	// case "vp8":
-	// 	pipelineStr += ", encoding-name=VP8-DRAFT-IETF-01 ! rtpvp8depay ! decodebin"
-	// case "opus":
-	// 	pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! decodebin"
-	// case "vp9":
-	// 	pipelineStr += " ! rtpvp9depay ! decodebin"
-	// case "h264":
-	// 	pipelineStr += " ! rtph264depay ! decodebin"
-	// case "g722":
-	// 	pipelineStr += " clock-rate=8000 ! rtpg722depay ! decodebin"
-	// default:
-	// 	panic("Unhandled codec " + codecName)
-	// }
+	// pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! decodebin"
 
 	// pipelineStrSink := "appsink name=output"
 
-	// var clockRate float32
+	// pipelineStr += " ! opusenc ! audio/x-opus ! " + pipelineStrSink
 
-	// switch strings.ToLower(codecName) {
-	// case "vp8":
-	// 	pipelineStr += " ! vp8enc ! video/x-vp8 ! " + pipelineStrSink
-	// 	clockRate = videoClockRate
-
-	// case "vp9":
-	// 	pipelineStr += " ! vp9enc ! " + pipelineStrSink
-	// 	clockRate = videoClockRate
-
-	// case "h264":
-	// 	pipelineStr += " ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=20 ! video/x-h264,stream-format=byte-stream ! " + pipelineStrSink
-	// 	clockRate = videoClockRate
-
-	// case "opus":
-	// 	pipelineStr += " ! opusenc ! audio/x-opus ! " + pipelineStrSink
-	// 	clockRate = audioClockRate
-
-	// case "g722":
-	// 	pipelineStr += " ! avenc_g722 ! " + pipelineStrSink
-	// 	clockRate = audioClockRate
-
-	// case "pcmu":
-	// 	pipelineStr += " ! audio/x-raw, rate=8000 ! mulawenc ! " + pipelineStrSink
-	// 	clockRate = pcmClockRate
-
-	// case "pcma":
-	// 	pipelineStr += " ! audio/x-raw, rate=8000 ! alawenc ! " + pipelineStrSink
-	// 	clockRate = pcmClockRate
-
-	// default:
-	// 	panic("Unhandled codec " + codecName)
-	// }
-
-	// log.Println(pipelineStr)
-	// log.Println(clockRate)
 	// pipeline, err = gst.ParseLaunch(pipelineStr)
 
 	// if err != nil {
 	// 	panic(err)
 	// }
-	// pipeline.SetState(gst.StatePlaying)
 
 	// src = pipeline.GetByName("input")
+	// sink = pipeline.GetByName("output")
 
 	// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
 	// for the given codec
+
+	pipeline.SetState(gst.StatePlaying)
+
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
 		go func() {
@@ -206,15 +176,21 @@ func gstreamerReceiveMain() {
 		for {
 			select {
 			case <-ticker.C:
-				fmt.Println("push ", len(buf[:i]))
+				if err != nil {
+					fmt.Errorf("push error: %v", err)
+				} else {
+					fmt.Println("push ", len(buf[:i]))
+				}
 			default:
 				i, _, err = track.Read(buf)
 				if err != nil {
 					panic(err)
 				}
 				err = src.PushBuffer(buf[:i])
+				receiveDone <- struct{}{}
 			}
 		}
+
 	})
 
 	// Set the handler for ICE connection state
@@ -226,7 +202,7 @@ func gstreamerReceiveMain() {
 	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
 
-	signal.Decode(signal.MustReadStdin(), &offer)
+	signal.Decode(<-signal.HTTPSDPServer(), &offer)
 
 	// Set the remote SessionDescription
 	err = peerConnection.SetRemoteDescription(offer)
@@ -264,29 +240,40 @@ func gstreamerReceiveMain() {
 func main() {
 	// Start a new thread to do the actual work for this application
 	go func() {
-		var lenData int
+		var err error
+		var out *gst.Sample
+		var debug interface{}
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		go func() {
 			for range ticker.C {
-				fmt.Println("pull ", lenData)
+				if err != nil {
+					fmt.Println("error: ", err)
+				} else {
+					fmt.Println("pull ", debug)
+				}
 			}
 		}()
 
 		for {
-			if sink == nil {
-				continue
-			}
-			out, err := sink.PullSample()
-			if err != nil {
-				continue
-			}
+			select {
+			case <-receiveDone:
+				for {
+					if sink == nil {
+						continue
+					}
 
-			lenData = len(out.Data)
+					out, err = sink.PullSample()
+					if err != nil {
+						continue
+					}
+					debug = out
 
-			if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
-				panic(err)
+					if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
+						panic(err)
+					}
+				}
 			}
 		}
 	}()
