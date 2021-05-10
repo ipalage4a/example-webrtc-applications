@@ -14,25 +14,45 @@ import (
 	"github.com/pion/example-webrtc-applications/v3/internal/signal"
 )
 
+type peer struct {
+	track *webrtc.TrackLocalStaticSample
+	sink  *gst.Element
+	src   *gst.Element
+}
+
+var peers []peer
+
 var peerConnection *webrtc.PeerConnection
-var track *webrtc.TrackLocalStaticSample
 
 var pipeline *gst.Pipeline
+var mixer, tee *gst.Element
 
-var src, sink *gst.Element
+// var src, sink *gst.Element
 
-var lastSrcElem, firstSinkElem *gst.Element
-
-var receiveDone chan struct{} = make(chan struct{}, 2)
-
-func initPipeline() (err error) {
-
+func initMuxer() (err error) {
 	pipeline, err = gst.PipelineNew("test")
 	if err != nil {
 		return
 	}
 
-	src, err = gst.ElementFactoryMake("appsrc", "input")
+	mixer, err = gst.ElementFactoryMake("audiomixer", "")
+	if err != nil {
+		return
+	}
+	tee, err = gst.ElementFactoryMake("tee", "")
+	if err != nil {
+		return err
+	}
+
+	pipeline.AddMany(mixer, tee)
+
+	mixer.Link(tee)
+
+	return
+}
+
+func newSrc() (src *gst.Element, err error) {
+	src, err = gst.ElementFactoryMake("appsrc", "")
 	if err != nil {
 		return
 	}
@@ -47,10 +67,26 @@ func initPipeline() (err error) {
 		return
 	}
 
-	bin, err := gst.ElementFactoryMake("opusdec", "")
+	opusDec, err := gst.ElementFactoryMake("opusdec", "")
 	if err != nil {
 		return
 	}
+
+	pipeline.AddMany(src, rtp_to_opus, opusDec)
+
+	src.LinkFiltered(rtp_to_opus, xrtp)
+	rtp_to_opus.Link(opusDec)
+
+	rawSrcPad := opusDec.GetStaticPad("src")
+
+	pdTemplate := mixer.GetPadTemplate("sink_%u")
+	mixerSinkPad := mixer.GetRequestPad(pdTemplate, "", nil)
+	rawSrcPad.Link(mixerSinkPad)
+
+	return
+}
+
+func newSink() (sink *gst.Element, err error) {
 
 	opusEnc, err := gst.ElementFactoryMake("opusenc", "")
 
@@ -59,22 +95,21 @@ func initPipeline() (err error) {
 		return
 	}
 
-	sink, err = gst.ElementFactoryMake("appsink", "output")
+	sink, err = gst.ElementFactoryMake("appsink", "")
 	if err != nil {
 		return
 	}
 
-	pipeline.AddMany(src, rtp_to_opus, bin, opusEnc, sink)
+	pipeline.AddMany(opusEnc, sink)
 
-	src.LinkFiltered(rtp_to_opus, xrtp)
-	rtp_to_opus.Link(bin)
+	pdTemplate := tee.GetPadTemplate("src_%u")
+	teePad := tee.GetRequestPad(pdTemplate, "", nil)
+	
+	opusEncPad := opusEnc.GetStaticPad("sink")
 
-	bin.Link(opusEnc)
-
-	rtp_to_opus.LinkFiltered(sink, xOpus)
+	teePad.Link(opusEncPad)
 
 	opusEnc.LinkFiltered(sink, xOpus)
-
 	return
 }
 
@@ -83,9 +118,13 @@ func initPipeline() (err error) {
 func gstreamerReceiveMain() {
 	// Everything below is the pion-WebRTC API! Thanks for using it ❤️.
 
-	sdpChan := signal.HTTPSDPServer()
+	var err error
+	err = initMuxer()
 
-	// Prepare the configuration
+	if err != nil {
+		panic(err)
+	}
+
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -94,119 +133,108 @@ func gstreamerReceiveMain() {
 		},
 	}
 
-	var err error
-	// Create a new RTCPeerConnection
-	peerConnection, err = webrtc.NewPeerConnection(config)
-	if err != nil {
-		panic(err)
-	}
+	sdpChan := signal.HTTPSDPServer()
 
-	// Create a audio track
-	track, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion1")
-	if err != nil {
-		panic(err)
-	}
-	_, err = peerConnection.AddTrack(track)
-	if err != nil {
-		panic(err)
-	}
+	for {
 
-	// trackName := "audio"
+		// Wait for the offer to be pasted
+		offer := webrtc.SessionDescription{}
 
-	err = initPipeline()
+		// signal.Decode(signal.MustReadStdin(), &offer)
+		signal.Decode(<-sdpChan, &offer)
 
-	// pipelineStr := "appsrc format=time is-live=true do-timestamp=true name=input ! application/x-rtp"
-
-	// pipelineStr += ", payload=96, encoding-name=OPUS ! rtpopusdepay ! opusdec"
-
-	// pipelineStrSink := "appsink name=output"
-
-	// pipelineStr += " ! opusenc ! audio/x-opus ! " + pipelineStrSink
-
-	// pipeline, err = gst.ParseLaunch(pipelineStr)
-
-	if err != nil {
-		panic(err)
-	}
-
-	src = pipeline.GetByName("input")
-	sink = pipeline.GetByName("output")
-
-	// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
-	// for the given codec
-
-	pipeline.SetState(gst.StatePlaying)
-
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
 		go func() {
-			ticker := time.NewTicker(time.Second * 3)
-			for range ticker.C {
-				rtcpSendErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
-				if rtcpSendErr != nil {
-					fmt.Println(rtcpSendErr)
-				}
-			}
-		}()
-
-		buf := make([]byte, 1400)
-		var i int
-
-		for {
-
-			i, _, err = track.Read(buf)
+			// Create a new RTCPeerConnection
+			peerConnection, err = webrtc.NewPeerConnection(config)
 			if err != nil {
 				panic(err)
 			}
-			err = src.PushBuffer(buf[:i])
-			fmt.Println("push ", len(buf[:i]))
-		}
 
-	})
+			// Create a audio track
+			track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion1")
 
-	// Set the handler for ICE connection state
-	// This will notify you when the peer has connected/disconnected
-	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		fmt.Printf("Connection State has changed %s \n", connectionState.String())
-	})
+			if err != nil {
+				panic(err)
+			}
+			_, err = peerConnection.AddTrack(track)
+			if err != nil {
+				panic(err)
+			}
 
-	// Wait for the offer to be pasted
-	offer := webrtc.SessionDescription{}
+			// Set a handler for when a new remote track starts, this handler creates a gstreamer pipeline
+			// for the given codec
 
-	// signal.Decode(signal.MustReadStdin(), &offer)
-	signal.Decode(<-sdpChan, &offer)
+			src, err := newSrc()
+			sink, err := newSink()
+			pipeline.SetState(gst.StatePlaying)
 
-	// Set the remote SessionDescription
-	err = peerConnection.SetRemoteDescription(offer)
-	if err != nil {
-		panic(err)
+			p := peer{track, sink, src}
+			peers = append(peers, p)
+
+			peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+				buf := make([]byte, 1400)
+				var i int
+
+				// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
+				go func() {
+					ticker := time.NewTicker(time.Second * 3)
+					for range ticker.C {
+						fmt.Println(buf[:i])
+						rtcpSendErr := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
+						if rtcpSendErr != nil {
+							fmt.Println(rtcpSendErr)
+						}
+					}
+				}()
+
+				for {
+
+					i, _, err = track.Read(buf)
+					if err != nil {
+						panic(err)
+					}
+					err = src.PushBuffer(buf[:i])
+				}
+
+			})
+
+			// Set the handler for ICE connection state
+			// This will notify you when the peer has connected/disconnected
+			peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+				fmt.Printf("Connection State has changed %s \n", connectionState.String())
+			})
+
+			// Set the remote SessionDescription
+			err = peerConnection.SetRemoteDescription(offer)
+			if err != nil {
+				panic(err)
+			}
+
+			// Create an answer
+			answer, err := peerConnection.CreateAnswer(nil)
+			if err != nil {
+				panic(err)
+			}
+
+			// Create channel that is blocked until ICE Gathering is complete
+			gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
+			// Sets the LocalDescription, and starts our UDP listeners
+			err = peerConnection.SetLocalDescription(answer)
+			if err != nil {
+				panic(err)
+			}
+
+			// Block until ICE Gathering is complete, disabling trickle ICE
+			// we do this because we only can exchange one signaling message
+			// in a production application you should exchange ICE Candidates via OnICECandidate
+			<-gatherComplete
+
+			// Output the answer in base64 so we can paste it in browser
+			fmt.Println(signal.Encode(*peerConnection.LocalDescription()))
+		}()
+
 	}
-
-	// Create an answer
-	answer, err := peerConnection.CreateAnswer(nil)
-	if err != nil {
-		panic(err)
-	}
-
-	// Create channel that is blocked until ICE Gathering is complete
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
-
-	// Sets the LocalDescription, and starts our UDP listeners
-	err = peerConnection.SetLocalDescription(answer)
-	if err != nil {
-		panic(err)
-	}
-
-	// Block until ICE Gathering is complete, disabling trickle ICE
-	// we do this because we only can exchange one signaling message
-	// in a production application you should exchange ICE Candidates via OnICECandidate
-	<-gatherComplete
-
-	// Output the answer in base64 so we can paste it in browser
-	fmt.Println(signal.Encode(*peerConnection.LocalDescription()))
-
-	// Block forever
-	select {}
 }
 
 func main() {
@@ -229,18 +257,16 @@ func main() {
 		}()
 
 		for {
-			if sink == nil {
-				continue
-			}
+			for _, p := range peers {
+				out, err = p.sink.PullSample()
+				if err != nil {
+					continue
+				}
+				debug = out
 
-			out, err = sink.PullSample()
-			if err != nil {
-				continue
-			}
-			debug = out
-
-			if err := track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
-				panic(err)
+				if err := p.track.WriteSample(media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(int64(out.Pts), 0)}); err != nil {
+					panic(err)
+				}
 			}
 		}
 	}()
