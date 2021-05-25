@@ -165,7 +165,8 @@ func gstreamerReceiveMain() {
 		},
 	}
 
-	sdpChan := signal.HTTPSDPServer()
+	localSdp := make(chan string, 1)
+	sdpChan := signal.HTTPSDPServerWithAnswer(localSdp)
 
 	var i int
 	for {
@@ -242,6 +243,7 @@ func gstreamerReceiveMain() {
 
 		// Output the answer in base64 so we can paste it in browser
 		fmt.Println(signal.Encode(*peerConnection.LocalDescription()))
+		localSdp <- signal.Encode(*peerConnection.LocalDescription())
 	}
 }
 
@@ -290,5 +292,6 @@ func main() {
 		}
 	}()
 
-	gstreamerReceiveMain()
+	go gstreamerReceiveMain()
+	select {}
 }

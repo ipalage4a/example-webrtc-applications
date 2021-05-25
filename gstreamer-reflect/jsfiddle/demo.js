@@ -32,7 +32,10 @@ navigator.mediaDevices.getUserMedia({ video: false, audio: true })
 pc.oniceconnectionstatechange = e => log(pc.iceConnectionState)
 pc.onicecandidate = event => {
   if (event.candidate === null) {
-    document.getElementById('localSessionDescription').value = btoa(JSON.stringify(pc.localDescription))
+    let sdp = btoa(JSON.stringify(pc.localDescription))
+    document.getElementById('localSessionDescription').value = sdp
+    
+    window.sendSdp(sdp)
   }
 }
 
@@ -57,6 +60,18 @@ window.startSession = () => {
   } catch (e) {
     alert(e)
   }
+}
+
+window.sendSdp = (sdp) => {
+  var xhttp = new XMLHttpRequest();
+  xhttp.onreadystatechange=function() {
+    if (this.readyState == 4 && this.status == 200) {
+      document.getElementById('remoteSessionDescription').value = this.responseText
+      window.startSession()
+    }
+  };
+  xhttp.open("POST", "http://localhost:8080/sdp", true);
+  xhttp.send(sdp);
 }
 
 window.addDisplayCapture = () => {
