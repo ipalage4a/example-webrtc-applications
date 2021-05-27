@@ -11,11 +11,12 @@ let log = msg => {
   document.getElementById('logs').innerHTML += msg + '<br>'
 }
 
-
 navigator.mediaDevices.getUserMedia({ video: false, audio: true })
   .then(stream => {
 
     stream.getTracks().forEach(function (track) {
+      window.track = track
+      track.enabled = false
       pc.addTrack(track, stream);
       var el = document.createElement(track.kind)
       el.srcObject = stream
@@ -44,10 +45,20 @@ pc.ontrack = function (event) {
   el.srcObject = event.streams[0]
   el.autoplay = true
   el.controls = true
+  el.muted = true
 
   document.getElementById('remote').appendChild(el)
 }
 
+window.toggleMute = () => {
+  if (window.track.enabled) {
+    document.body.style.backgroundColor = "red"
+    window.track.enabled = false
+  } else {
+    document.body.style.backgroundColor = "white"
+    window.track.enabled = true
+  }
+}
 
 window.startSession = () => {
   let sd = document.getElementById('remoteSessionDescription').value

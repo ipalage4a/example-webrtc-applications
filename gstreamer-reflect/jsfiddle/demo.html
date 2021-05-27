@@ -1,10 +1,15 @@
-
+<style>
+    body {
+        background-color: red;
+    }
+</style>
 Browser base64 Session Description<br />
 <textarea id="localSessionDescription" readonly="true"></textarea> <br />
 
 Golang base64 Session Description<br />
 <textarea id="remoteSessionDescription"></textarea> <br/>
 <button onclick="window.startSession()"> Start Session </button>
+<button onclick="window.toggleMute()"> Mute </button>
 <button onclick="window.addDisplayCapture()" id="displayCapture"> Display Capture </button><br />
 
 <br />
