@@ -3,39 +3,38 @@ package main
 import (
 	"C"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/ipalage4a/gst"
+
 	"github.com/pion/example-webrtc-applications/v3/internal/signal"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 )
-import "sort"
+import "log"
 
 type peer struct {
-	peer   *webrtc.PeerConnection
-	track  *webrtc.TrackLocalStaticSample
-	src    *gst.Element
-	buzzer *gst.Element
-	sink   *gst.Element
-	queue  *gst.Element
-	tee    *gst.Element
-	mixer  *gst.Element
-
-	opusDecSrc *gst.Pad
-	buzzerSrc  *gst.Pad
-	teeSink    *gst.Pad
-	mixerSink  *gst.Pad
+	peer  *webrtc.PeerConnection
+	track *webrtc.TrackLocalStaticSample
+	src   *gst.Element
+	sink  *gst.Element
+	tee   *gst.Element
+	mixer *gst.Element
 
 	debug struct {
-		push string
+		push interface{}
 		pull interface{}
 	}
 }
 
 func (p *peer) teeToPeer(other *peer) {
+	if state := pipeline.SetState(gst.StatePlaying); state > 0 {
+		log.Println(state)
+	}
+
 	var src *gst.Pad
 
 	srcTpl := p.tee.GetPadTemplate("src_%u")
@@ -46,15 +45,11 @@ func (p *peer) teeToPeer(other *peer) {
 
 	src.Link(sink)
 
-	pipeline.SetState(gst.StatePlaying)
-}
-
-func (p *peer) cancelBuzz() {
-	if p.buzzer != nil {
-		p.buzzerSrc.Unlink(p.mixerSink)
-		p.opusDecSrc.Link(p.teeSink)
-		pipeline.Remove(p.buzzer)
-		p.buzzer = nil
+	for {
+		if state := pipeline.SetState(gst.StatePlaying); state > 0 {
+			log.Println(state)
+			break
+		}
 	}
 }
 
@@ -63,19 +58,7 @@ var peers map[int]*peer = make(map[int]*peer)
 
 var config webrtc.Configuration
 
-type pip struct {
-	*gst.Pipeline
-	state gst.StateOptions
-}
-
-func (p *pip) SetState(state gst.StateOptions) {
-	// if p.state != state {
-	p.state = state
-	p.Pipeline.SetState(state)
-	// }
-}
-
-var pipeline = pip{}
+var pipeline *gst.Pipeline
 
 func getPeers() map[int]*peer {
 	listLock.Lock()
@@ -90,12 +73,11 @@ func addPeer(key int, p *peer) {
 }
 
 func initPipeline() (err error) {
-	p, err := gst.PipelineNew("test")
+	pipeline, err = gst.PipelineNew("test")
 	if err != nil {
 		panic(err)
 	}
 
-	pipeline.Pipeline = p
 	pipeline.SetState(gst.StatePlaying)
 	return
 }
@@ -134,8 +116,10 @@ func initPeer(i int) (p *peer, err error) {
 	src.SetObject("format", int(gst.FormatTime))
 	src.SetObject("is-live", true)
 	src.SetObject("do-timestamp", true)
-	// src.SetObject("min-latency", int(time.Millisecond*500))
-	// src.SetObject("max-latency", int(time.Millisecond*1000))
+	src.SetObject("max-bytes", 0)
+	src.SetObject("min-latency", int(time.Millisecond*100))
+	src.SetObject("max-latency", int(time.Millisecond*500))
+
 	srcQueue, err := gst.ElementFactoryMake("queue2", "")
 	if err != nil {
 		return
@@ -152,13 +136,6 @@ func initPeer(i int) (p *peer, err error) {
 	if err != nil {
 		return
 	}
-	opusDecSrc := opusDec.GetStaticPad("src")
-
-	tee, err := gst.ElementFactoryMake("tee", "")
-	if err != nil {
-		return
-	}
-	teeSink := tee.GetStaticPad("sink")
 
 	srcConvert, err := gst.ElementFactoryMake("audioconvert", "")
 	if err != nil {
@@ -170,7 +147,7 @@ func initPeer(i int) (p *peer, err error) {
 		return
 	}
 
-	mixer, err := gst.ElementFactoryMake("audiomixer", "")
+	mixer, err := gst.ElementFactoryMake("adder", "")
 	if err != nil {
 		return
 	}
@@ -180,17 +157,12 @@ func initPeer(i int) (p *peer, err error) {
 		return
 	}
 
-	xOpus := gst.CapsFromString("audio/x-opus")
-	if err != nil {
-		return
-	}
-
 	sink, err := gst.ElementFactoryMake("appsink", "")
 	if err != nil {
 		return
 	}
 
-	sinkQueue, err := gst.ElementFactoryMake("queue2", "")
+	sinkQueue, err := gst.ElementFactoryMake("queue", "")
 	if err != nil {
 		return
 	}
@@ -200,46 +172,23 @@ func initPeer(i int) (p *peer, err error) {
 		track: track,
 		src:   src,
 		sink:  sink,
-		tee:   tee,
 		mixer: mixer,
-
-		opusDecSrc: opusDecSrc,
-		teeSink:    teeSink,
 	}
 
-	pipeline.AddMany(src, srcQueue, rtp_to_opus, opusDec, mixer, tee, opusEnc, sinkQueue, sink, srcConvert, sinkConvert)
+	pipeline.AddMany(src, srcQueue, rtp_to_opus, opusDec, mixer, opusEnc, sinkQueue, sink, srcConvert, sinkConvert)
 
 	src.Link(srcQueue)
 	srcQueue.LinkFiltered(rtp_to_opus, xrtp)
 	rtp_to_opus.Link(opusDec)
-	opusDec.Link(tee)
-
-	for key, peer := range getPeers() {
-		fmt.Printf("\n\nconnect %d to %d peer\n\n", i, key)
-		p.teeToPeer(peer)
-		fmt.Printf("\n\nconnect %d to %d peer\n\n", key, i)
-		peer.teeToPeer(p)
-	}
+	opusDec.Link(mixer)
 
 	mixer.Link(sinkQueue)
 	sinkQueue.Link(sinkConvert)
 	sinkConvert.Link(opusEnc)
-	opusEnc.LinkFiltered(sink, xOpus)
-
-	// src.SetState(gst.StatePlaying)
-	// srcQueue.SetState(gst.StatePlaying)
-	// rtp_to_opus.SetState(gst.StatePlaying)
-	// opusDec.SetState(gst.StatePlaying)
-	// mixer.SetState(gst.StatePlaying)
-	// tee.SetState(gst.StatePlaying)
-	// opusEnc.SetState(gst.StatePlaying)
-	// sink.SetState(gst.StatePlaying)
-	// sinkQueue.SetState(gst.StatePlaying)
-	// mixer.SetState(gst.StatePlaying)
-	// srcConvert.SetState(gst.StatePlaying)
-	// sinkConvert.SetState(gst.StatePlaying)
+	opusEnc.Link(sink)
 
 	addPeer(i, p)
+	pipeline.SetState(gst.StatePlaying)
 
 	return
 }
@@ -288,7 +237,7 @@ func gstreamerReceiveMain() {
 
 			// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
 			go func() {
-				ticker := time.NewTicker(time.Second * 1)
+				ticker := time.NewTicker(time.Second * 3)
 				for range ticker.C {
 					rtcpSendErr := p.peer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
 					if rtcpSendErr != nil {
@@ -307,7 +256,7 @@ func gstreamerReceiveMain() {
 					panic(err)
 				}
 
-				p.debug.push = fmt.Sprint(i)
+				p.debug.push = i
 			}
 
 		})
@@ -367,7 +316,7 @@ func main() {
 				fmt.Printf("\n--------------")
 				for _, k := range keys {
 					fmt.Printf("\ndebug peer %d\n", k)
-					fmt.Printf("\tpush: %s\n", ps[k].debug.push)
+					fmt.Printf("\tpush: %v\n", ps[k].debug.push)
 					fmt.Printf("\tpull: %v\n", ps[k].debug.pull)
 				}
 				fmt.Printf("--------------\n")
@@ -380,14 +329,18 @@ func main() {
 		var out *gst.Sample
 
 		for {
+			ts := time.Now().Add(time.Millisecond * 500)
 			for _, p := range getPeers() {
 				out, err = p.sink.PullSample()
 				if err != nil {
+					// fmt.Println(err)
 					continue
 				}
 
-				sample := media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(0, int64(out.Pts))}
-				p.debug.pull = sample.Timestamp
+				// sample := media.Sample{Data: out.Data, Duration: time.Duration(out.Duration), Timestamp: time.Unix(0, int64(out.Pts)).Add(time.Millisecond * 200)}
+				sample := media.Sample{Data: out.Data, Duration: time.Duration(out.Duration)}
+				sample.Timestamp = ts
+				p.debug.pull = out
 
 				if err := p.track.WriteSample(sample); err != nil {
 					panic(err)

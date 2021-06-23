@@ -25,7 +25,7 @@
 	},
 	{
 		"title": "WebSocket SFU",
-		"link": "#",
+		"link": "sfu-ws",
 		"description": "The SFU example demonstrates a conference system that uses WebSockets for signaling. It also includes a flutter client for Android, iOS and Native.",
 		"type": "browser"
 	},

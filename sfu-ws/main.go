@@ -79,7 +79,7 @@ func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP {
 	listLock.Lock()
 	defer func() {
 		listLock.Unlock()
-		signalPeerConnections()
+		signalPeerConnections("add track")
 	}()
 
 	// Create a new TrackLocal with the same codec as our incoming
@@ -97,14 +97,15 @@ func removeTrack(t *webrtc.TrackLocalStaticRTP) {
 	listLock.Lock()
 	defer func() {
 		listLock.Unlock()
-		signalPeerConnections()
+		signalPeerConnections("remove track")
 	}()
 
 	delete(trackLocals, t.ID())
 }
 
 // signalPeerConnections updates each PeerConnection so that it is getting all the expected media tracks
-func signalPeerConnections() {
+func signalPeerConnections(reason string) {
+	log.Println("signal reason: ", reason)
 	listLock.Lock()
 	defer func() {
 		listLock.Unlock()
@@ -115,6 +116,7 @@ func signalPeerConnections() {
 		for i := range peerConnections {
 			if peerConnections[i].peerConnection.ConnectionState() == webrtc.PeerConnectionStateClosed {
 				peerConnections = append(peerConnections[:i], peerConnections[i+1:]...)
+				log.Println("remove peer")
 				return true // We modified the slice, start from the beginning
 			}
 
@@ -156,10 +158,12 @@ func signalPeerConnections() {
 
 			offer, err := peerConnections[i].peerConnection.CreateOffer(nil)
 			if err != nil {
+				log.Println(err)
 				return true
 			}
 
 			if err = peerConnections[i].peerConnection.SetLocalDescription(offer); err != nil {
+				log.Println(err)
 				return true
 			}
 
@@ -184,7 +188,7 @@ func signalPeerConnections() {
 			// Release the lock and attempt a sync in 3 seconds. We might be blocking a RemoveTrack or AddTrack
 			go func() {
 				time.Sleep(time.Second * 3)
-				signalPeerConnections()
+				signalPeerConnections("new attempt")
 			}()
 			return
 		}
@@ -282,7 +286,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 				log.Print(err)
 			}
 		case webrtc.PeerConnectionStateClosed:
-			signalPeerConnections()
+			signalPeerConnections("peer closed")
 		}
 	})
 
@@ -305,7 +309,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Signal for the new PeerConnection
-	signalPeerConnections()
+	signalPeerConnections("init")
 
 	message := &websocketMessage{}
 	for {
