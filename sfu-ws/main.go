@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io/ioutil"
@@ -24,18 +25,21 @@ var (
 
 	// lock for peerConnections and trackLocals
 	listLock        sync.RWMutex
-	peerConnections []peerConnectionState
+	peerConnections = make(map[int]*peerConnectionState)
 	trackLocals     map[string]*webrtc.TrackLocalStaticRTP
 )
 
 type websocketMessage struct {
 	Event string `json:"event"`
 	Data  string `json:"data"`
+	Id    int    `json:"id"`
 }
 
 type peerConnectionState struct {
-	peerConnection *webrtc.PeerConnection
-	websocket      *threadSafeWriter
+	*webrtc.PeerConnection
+	websocket *threadSafeWriter
+	mux       sync.Mutex
+	mayOffer  func()
 }
 
 func main() {
@@ -106,24 +110,26 @@ func removeTrack(t *webrtc.TrackLocalStaticRTP) {
 // signalPeerConnections updates each PeerConnection so that it is getting all the expected media tracks
 func signalPeerConnections(reason string) {
 	log.Println("signal reason: ", reason)
-	listLock.Lock()
-	defer func() {
-		listLock.Unlock()
-		dispatchKeyFrame()
-	}()
-
 	attemptSync := func() (tryAgain bool) {
-		for i := range peerConnections {
-			if peerConnections[i].peerConnection.ConnectionState() == webrtc.PeerConnectionStateClosed {
-				peerConnections = append(peerConnections[:i], peerConnections[i+1:]...)
+		listLock.Lock()
+		defer func() {
+			listLock.Unlock()
+			dispatchKeyFrame()
+		}()
+
+		for i, pc := range peerConnections {
+			log.Println("signal for ", i, " peer")
+			switch pc.ConnectionState() {
+			case webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateDisconnected:
+				delete(peerConnections, i)
 				log.Println("remove peer")
-				return true // We modified the slice, start from the beginning
+				return true
 			}
 
 			// map of sender we already are seanding, so we don't double send
 			existingSenders := map[string]bool{}
 
-			for _, sender := range peerConnections[i].peerConnection.GetSenders() {
+			for _, sender := range pc.GetSenders() {
 				if sender.Track() == nil {
 					continue
 				}
@@ -132,14 +138,14 @@ func signalPeerConnections(reason string) {
 
 				// If we have a RTPSender that doesn't map to a existing track remove and signal
 				if _, ok := trackLocals[sender.Track().ID()]; !ok {
-					if err := peerConnections[i].peerConnection.RemoveTrack(sender); err != nil {
+					if err := pc.RemoveTrack(sender); err != nil {
 						return true
 					}
 				}
 			}
 
 			// Don't receive videos we are sending, make sure we don't have loopback
-			for _, receiver := range peerConnections[i].peerConnection.GetReceivers() {
+			for _, receiver := range pc.GetReceivers() {
 				if receiver.Track() == nil {
 					continue
 				}
@@ -150,21 +156,48 @@ func signalPeerConnections(reason string) {
 			// Add all track we aren't sending yet to the PeerConnection
 			for trackID := range trackLocals {
 				if _, ok := existingSenders[trackID]; !ok {
-					if _, err := peerConnections[i].peerConnection.AddTrack(trackLocals[trackID]); err != nil {
+					if _, err := pc.AddTrack(trackLocals[trackID]); err != nil {
 						return true
 					}
 				}
 			}
 
-			offer, err := peerConnections[i].peerConnection.CreateOffer(nil)
+			offer, err := pc.CreateOffer(nil)
 			if err != nil {
 				log.Println(err)
 				return true
 			}
 
-			if err = peerConnections[i].peerConnection.SetLocalDescription(offer); err != nil {
-				log.Println(err)
-				return true
+			// Этот контекст используется для проверки надлежащего состояния для установки нового оффера в локал дескрипшен
+			// Если сейчас состояние стейбл до завершаем контекст
+			// Иначе ждем пока контекст завершит каллбек на изменение сигналинг стейта
+			var ctx context.Context
+			ctx, pc.mayOffer = context.WithCancel(context.Background())
+			if pc.SignalingState() == webrtc.SignalingStateStable {
+				log.Println("SS: signaling is stable")
+				pc.mayOffer()
+			} else {
+				log.Println("SS: waiting stable")
+			}
+			<-ctx.Done()
+
+			if err = pc.SetLocalDescription(offer); err != nil {
+
+				// var ctx context.Context
+				// ctx, mayOffer = context.WithCancel(context.Background())
+				// if pc.SignalingState() == webrtc.SignalingStateStable {
+				// 	log.Println("SS: signaling is stable")
+				// 	mayOffer()
+				// } else {
+				// 	log.Println("SS: waiting stable")
+				// }
+				// <-ctx.Done()
+
+				if err = pc.SetLocalDescription(offer); err != nil {
+					log.Println("second: ", err)
+					return true
+				}
+				log.Println("now is okay")
 			}
 
 			offerString, err := json.Marshal(offer)
@@ -172,8 +205,8 @@ func signalPeerConnections(reason string) {
 				return true
 			}
 
-			if err = peerConnections[i].websocket.WriteJSON(&websocketMessage{
-				Event: "offer",
+			if err = pc.websocket.WriteJSON(&websocketMessage{
+				Event: "sdp",
 				Data:  string(offerString),
 			}); err != nil {
 				return true
@@ -185,11 +218,7 @@ func signalPeerConnections(reason string) {
 
 	for syncAttempt := 0; ; syncAttempt++ {
 		if syncAttempt == 25 {
-			// Release the lock and attempt a sync in 3 seconds. We might be blocking a RemoveTrack or AddTrack
-			go func() {
-				time.Sleep(time.Second * 3)
-				signalPeerConnections("new attempt")
-			}()
+			log.Println("max attempts reached: ", syncAttempt)
 			return
 		}
 
@@ -205,12 +234,12 @@ func dispatchKeyFrame() {
 	defer listLock.Unlock()
 
 	for i := range peerConnections {
-		for _, receiver := range peerConnections[i].peerConnection.GetReceivers() {
+		for _, receiver := range peerConnections[i].GetReceivers() {
 			if receiver.Track() == nil {
 				continue
 			}
 
-			_ = peerConnections[i].peerConnection.WriteRTCP([]rtcp.Packet{
+			_ = peerConnections[i].WriteRTCP([]rtcp.Packet{
 				&rtcp.PictureLossIndication{
 					MediaSSRC: uint32(receiver.Track().SSRC()),
 				},
@@ -219,7 +248,7 @@ func dispatchKeyFrame() {
 	}
 }
 
-// Handle incoming websockets
+// Обработчик входящих сообщений
 func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	// Upgrade HTTP request to Websocket
 	unsafeConn, err := upgrader.Upgrade(w, r, nil)
@@ -233,85 +262,8 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	// When this frame returns close the Websocket
 	defer c.Close() //nolint
 
-	// Create new PeerConnection
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	// When this frame returns close the PeerConnection
-	defer peerConnection.Close() //nolint
-
-	// Accept one audio and one video track incoming
-	for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
-		if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionRecvonly,
-		}); err != nil {
-			log.Print(err)
-			return
-		}
-	}
-
-	// Add our new PeerConnection to global list
-	listLock.Lock()
-	peerConnections = append(peerConnections, peerConnectionState{peerConnection, c})
-	listLock.Unlock()
-
-	// Trickle ICE. Emit server candidate to client
-	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
-		if i == nil {
-			return
-		}
-
-		candidateString, err := json.Marshal(i.ToJSON())
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		if writeErr := c.WriteJSON(&websocketMessage{
-			Event: "candidate",
-			Data:  string(candidateString),
-		}); writeErr != nil {
-			log.Println(writeErr)
-		}
-	})
-
-	// If PeerConnection is closed remove it from global list
-	peerConnection.OnConnectionStateChange(func(p webrtc.PeerConnectionState) {
-		switch p {
-		case webrtc.PeerConnectionStateFailed:
-			if err := peerConnection.Close(); err != nil {
-				log.Print(err)
-			}
-		case webrtc.PeerConnectionStateClosed:
-			signalPeerConnections("peer closed")
-		}
-	})
-
-	peerConnection.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		// Create a track to fan out our incoming video to all peers
-		trackLocal := addTrack(t)
-		defer removeTrack(trackLocal)
-
-		buf := make([]byte, 1500)
-		for {
-			i, _, err := t.Read(buf)
-			if err != nil {
-				return
-			}
-
-			if _, err = trackLocal.Write(buf[:i]); err != nil {
-				return
-			}
-		}
-	})
-
-	// Signal for the new PeerConnection
-	signalPeerConnections("init")
-
 	message := &websocketMessage{}
+
 	for {
 		_, raw, err := c.ReadMessage()
 		if err != nil {
@@ -322,6 +274,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		log.Println("received: ", message.Event)
 		switch message.Event {
 		case "candidate":
 			candidate := webrtc.ICECandidateInit{}
@@ -330,20 +283,163 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			if err := peerConnection.AddICECandidate(candidate); err != nil {
+			if err := peerConnections[message.Id].AddICECandidate(candidate); err != nil {
 				log.Println(err)
 				return
 			}
-		case "answer":
-			answer := webrtc.SessionDescription{}
-			if err := json.Unmarshal([]byte(message.Data), &answer); err != nil {
+		// Предварительная установка вебртс соединения
+		case "offer":
+			var err error
+			peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			// When this frame returns close the PeerConnection
+			defer peerConnection.Close() //nolint
+
+			// Accept one audio and one video track incoming
+			for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+				if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+					Direction: webrtc.RTPTransceiverDirectionRecvonly,
+				}); err != nil {
+					log.Print(err)
+					return
+				}
+			}
+
+			pc := &peerConnectionState{peerConnection, c, sync.Mutex{}, nil}
+			// Add our new PeerConnection to global list
+			listLock.Lock()
+			peerConnections[message.Id] = pc
+			listLock.Unlock()
+
+			// If PeerConnection is closed remove it from global list
+			peerConnections[message.Id].OnConnectionStateChange(func(p webrtc.PeerConnectionState) {
+				switch p {
+				case webrtc.PeerConnectionStateFailed:
+					if err := peerConnections[message.Id].Close(); err != nil {
+						log.Print(err)
+					}
+				case webrtc.PeerConnectionStateClosed:
+					signalPeerConnections("peer closed")
+				}
+			})
+
+			peerConnections[message.Id].OnSignalingStateChange(func(ss webrtc.SignalingState) {
+				switch ss {
+				case webrtc.SignalingStateStable:
+					log.Println("SS: may offer!")
+					if pc.mayOffer != nil {
+						log.Println("SS: call done may offer")
+						pc.mayOffer()
+					}
+				default:
+				}
+			})
+
+			peerConnections[message.Id].OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+				// Create a track to fan out our incoming video to all peers
+				trackLocal := addTrack(t)
+				defer removeTrack(trackLocal)
+
+				buf := make([]byte, 1500)
+				for {
+					i, _, err := t.Read(buf)
+					if err != nil {
+						return
+					}
+
+					if _, err = trackLocal.Write(buf[:i]); err != nil {
+						return
+					}
+				}
+			})
+
+			//Устанавливаем оффер с клиент и отправляем обратно ансвер
+			description := webrtc.SessionDescription{}
+			if err := json.Unmarshal([]byte(message.Data), &description); err != nil {
 				log.Println(err)
 				return
 			}
 
-			if err := peerConnection.SetRemoteDescription(answer); err != nil {
+			if err := peerConnections[message.Id].SetRemoteDescription(description); err != nil {
 				log.Println(err)
 				return
+			}
+
+			answer, err := peerConnections[message.Id].CreateAnswer(nil)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			peerConnections[message.Id].mux.Lock()
+			if err = peerConnections[message.Id].SetLocalDescription(answer); err != nil {
+				peerConnections[message.Id].mux.Unlock()
+				log.Println(err)
+				return
+			}
+			peerConnections[message.Id].mux.Unlock()
+
+			// Отправляем локал дескрипшен, потому что в ансвере нет айс-кандидатов
+			answerString, err := json.Marshal(peerConnections[message.Id].LocalDescription())
+			if err != nil {
+				return
+			}
+
+			if err = c.WriteJSON(&websocketMessage{
+				Event: "sdp",
+				Data:  string(answerString),
+			}); err != nil {
+				return
+			}
+
+			// Signal for the new PeerConnection
+			signalPeerConnections("init")
+
+		case "sdp":
+			// Получение и установка RemoteDescription
+			// Так же если description.Type == "offer" отправляем ответ обратно
+			description := webrtc.SessionDescription{}
+			if err := json.Unmarshal([]byte(message.Data), &description); err != nil {
+				log.Println(err)
+				return
+			}
+
+			log.Println("\tsdp type: ", description.Type)
+
+			if err := peerConnections[message.Id].SetRemoteDescription(description); err != nil {
+				log.Println(err)
+				return
+			}
+
+			if description.Type == webrtc.SDPTypeOffer {
+				answer, err := peerConnections[message.Id].CreateAnswer(nil)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				peerConnections[message.Id].mux.Lock()
+				if err = peerConnections[message.Id].SetLocalDescription(answer); err != nil {
+					peerConnections[message.Id].mux.Unlock()
+					log.Println(err)
+					return
+				}
+				peerConnections[message.Id].mux.Unlock()
+
+				answerString, err := json.Marshal(answer)
+				if err != nil {
+					return
+				}
+
+				if err = c.WriteJSON(&websocketMessage{
+					Event: "sdp",
+					Data:  string(answerString),
+				}); err != nil {
+					return
+				}
 			}
 		}
 	}

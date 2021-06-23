@@ -6,6 +6,8 @@
 </head>
 
 <body>
+  <button id="add-media">Add media</button>
+
   <h3> Local Video </h3>
   <video id="localVideo" width="160" height="120" autoplay muted></video> <br />
 
@@ -19,80 +21,119 @@
 </body>
 
 <script>
-  navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    .then(stream => {
-      let pc = new RTCPeerConnection()
-      pc.ontrack = function (event) {
-        if (event.track.kind === 'audio') {
-          return
-        }
+  // Создаем пир коннекшн и навешиваем на него необходимые коллбеки
+  let pc = new RTCPeerConnection()
+  pc.ts = new Date().getUTCMilliseconds();
 
-        let el = document.createElement(event.track.kind)
-        el.srcObject = event.streams[0]
-        el.autoplay = true
-        el.controls = true
-        document.getElementById('remoteVideos').appendChild(el)
 
-        event.track.onmute = function (event) {
-          el.play()
-        }
+  // Создаем новое вебсокетно подключение для отправления сигналов вебртс на сервер
+  let ws = new WebSocket("{{.}}")
 
-        event.streams[0].onremovetrack = ({ track }) => {
-          if (el.parentNode) {
-            el.parentNode.removeChild(el)
-          }
+  ws.onclose = function (evt) {
+    console.log("Websocket has closed")
+  }
+
+  // каллбек для обработки новых сообщений с севера
+  ws.onmessage = async function (evt) {
+    let msg = JSON.parse(evt.data)
+    if (!msg) {
+      return console.log('failed to parse msg')
+    }
+
+    console.log("received: ", msg.event)
+    switch (msg.event) {
+      case 'sdp':
+        let description = JSON.parse(msg.data)
+        if (!description) {
+          return console.log('failed to parse answer')
         }
+        
+        console.log("\t", description.type)
+        await pc.setRemoteDescription(description)
+
+        if (description.type == "offer") {
+          await pc.setLocalDescription()
+          ws.send(JSON.stringify({ event: 'sdp',id: pc.ts, data: JSON.stringify(pc.localDescription) }))
+        }
+        return
+    }
+  }
+
+  ws.onerror = function (evt) {
+    console.log("ERROR: " + evt.data)
+  }
+
+  ws.onopen = async function () {
+    await initPc()
+    ws.send(JSON.stringify({ event: "offer",id: pc.ts, data: JSON.stringify(pc.localDescription) }))
+  }
+
+  // создаем обработчик для кнопок подключения
+  let addMedia = document.querySelector("#add-media")
+
+  addMedia.onclick = function () {
+    navigator.mediaDevices.getUserMedia({ video: {width: 180, height: 180}, audio: true })
+      .then(stream => {
+        document.getElementById('localVideo').srcObject = stream
+        stream.getTracks().forEach(track => pc.addTrack(track, stream))
+      }).catch(window.alert)
+  }
+
+
+  async function initPc() {
+    // Трансиверы для возможности получение айс-кандидатов без запроса доступа к медиа
+    pc.addTransceiver("audio")
+    pc.addTransceiver("video")
+
+    // Каллбеке обработки нового трека, полученного из RemoteDescription
+    pc.ontrack = function (event) {
+      if (event.track.kind === 'audio') {
+        return
       }
 
-      document.getElementById('localVideo').srcObject = stream
-      stream.getTracks().forEach(track => pc.addTrack(track, stream))
+      let el = document.createElement(event.track.kind)
+      el.srcObject = event.streams[0]
+      el.widht = 180
+      el.height = 180
+      el.autoplay = true
+      el.controls = true
+      document.getElementById('remoteVideos').appendChild(el)
 
-      let ws = new WebSocket("{{.}}")
-      pc.onicecandidate = e => {
-        if (!e.candidate) {
-          return
-        }
-
-        ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }))
+      event.track.onmute = function (event) {
+        el.play()
       }
 
-      ws.onclose = function (evt) {
-        window.alert("Websocket has closed")
-      }
-
-      ws.onmessage = function (evt) {
-        let msg = JSON.parse(evt.data)
-        if (!msg) {
-          return console.log('failed to parse msg')
-        }
-
-        switch (msg.event) {
-          case 'offer':
-            let offer = JSON.parse(msg.data)
-            if (!offer) {
-              return console.log('failed to parse answer')
-            }
-            pc.setRemoteDescription(offer)
-            pc.createAnswer().then(answer => {
-              pc.setLocalDescription(answer)
-              ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }))
-            })
-            return
-
-          case 'candidate':
-            let candidate = JSON.parse(msg.data)
-            if (!candidate) {
-              return console.log('failed to parse candidate')
-            }
-
-            pc.addIceCandidate(candidate)
+      event.streams[0].onremovetrack = ({ track }) => {
+        if (el.parentNode) {
+          el.parentNode.removeChild(el)
         }
       }
+    }
 
-      ws.onerror = function (evt) {
-        console.log("ERROR: " + evt.data)
+    // Каллбек, который возможно понадобиться позже
+    // Файрится когда мы добавляем новый трек, например
+    pc.onnegotiationneeded = async () => {
+      console.log("onnegotiationneeded")
+
+      // Неявно создаем новый оффер после добавления трека для отправки
+      await pc.setLocalDescription()
+      console.log(pc.localDescription.type)
+      ws.send(JSON.stringify({ event: 'sdp',id: pc.ts, data: JSON.stringify(pc.localDescription) }))
+    }
+
+    // Каллбек, который файрится когда браузер может генерировать новые айс-кандидаты
+    // (Обычно, айс-кандидаты начинают лететь когда мы добавляем новый трек-отправитель)
+    pc.onicecandidate = e => {
+      if (!e.candidate) {
+        return
       }
-    }).catch(window.alert)
+      ws.send(JSON.stringify({ event: 'candidate',id: pc.ts, data: JSON.stringify(e.candidate) }))
+    }
+
+    // Неявно создаем новый оффер и сетим его в локал дескрипшен, чтобы отправить позже
+    await pc.setLocalDescription()
+  }
+
 </script>
 
 </html>
