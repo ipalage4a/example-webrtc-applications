@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"io/ioutil"
@@ -39,7 +38,6 @@ type peerConnectionState struct {
 	*webrtc.PeerConnection
 	websocket *threadSafeWriter
 	mux       sync.Mutex
-	mayOffer  func()
 }
 
 func main() {
@@ -168,36 +166,17 @@ func signalPeerConnections(reason string) {
 				return true
 			}
 
-			// Этот контекст используется для проверки надлежащего состояния для установки нового оффера в локал дескрипшен
-			// Если сейчас состояние стейбл до завершаем контекст
-			// Иначе ждем пока контекст завершит каллбек на изменение сигналинг стейта
-			var ctx context.Context
-			ctx, pc.mayOffer = context.WithCancel(context.Background())
-			if pc.SignalingState() == webrtc.SignalingStateStable {
-				log.Println("SS: signaling is stable")
-				pc.mayOffer()
-			} else {
-				log.Println("SS: waiting stable")
-			}
-			<-ctx.Done()
-
-			if err = pc.SetLocalDescription(offer); err != nil {
-
-				// var ctx context.Context
-				// ctx, mayOffer = context.WithCancel(context.Background())
-				// if pc.SignalingState() == webrtc.SignalingStateStable {
-				// 	log.Println("SS: signaling is stable")
-				// 	mayOffer()
-				// } else {
-				// 	log.Println("SS: waiting stable")
-				// }
-				// <-ctx.Done()
-
-				if err = pc.SetLocalDescription(offer); err != nil {
-					log.Println("second: ", err)
-					return true
+			// Цикл здесь для того, чтобы поймать нужный сигналинг стейт
+			// для установки нового оффера
+			for i := 1; ; i++ {
+				log.Println("set local description attempt: ", i)
+				err = pc.SetLocalDescription(offer)
+				if err == nil {
+					break
 				}
-				log.Println("now is okay")
+				// Без тайм-аут - может получиться 1000+ попыток
+				// С тайм-аутом - макс 2
+				time.Sleep(time.Millisecond * 100)
 			}
 
 			offerString, err := json.Marshal(offer)
@@ -308,7 +287,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			pc := &peerConnectionState{peerConnection, c, sync.Mutex{}, nil}
+			pc := &peerConnectionState{peerConnection, c, sync.Mutex{}}
 			// Add our new PeerConnection to global list
 			listLock.Lock()
 			peerConnections[message.Id] = pc
@@ -327,15 +306,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 			})
 
 			peerConnections[message.Id].OnSignalingStateChange(func(ss webrtc.SignalingState) {
-				switch ss {
-				case webrtc.SignalingStateStable:
-					log.Println("SS: may offer!")
-					if pc.mayOffer != nil {
-						log.Println("SS: call done may offer")
-						pc.mayOffer()
-					}
-				default:
-				}
+				log.Println("ss is ", ss)
 			})
 
 			peerConnections[message.Id].OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
