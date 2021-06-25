@@ -254,6 +254,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Println("received: ", message.Event)
+
 		switch message.Event {
 		case "candidate":
 			candidate := webrtc.ICECandidateInit{}
@@ -305,6 +306,27 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			})
 
+			// Trickle ICE. Emit server candidate to client
+			peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
+				log.Printf("OnIceCandidate: %v\n", i)
+				if i == nil {
+					return
+				}
+
+				candidateString, err := json.Marshal(i.ToJSON())
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				if writeErr := c.WriteJSON(&websocketMessage{
+					Event: "candidate",
+					Data:  string(candidateString),
+				}); writeErr != nil {
+					log.Println(writeErr)
+				}
+			})
+
 			peerConnections[message.Id].OnSignalingStateChange(func(ss webrtc.SignalingState) {
 				log.Println("ss is ", ss)
 			})
@@ -345,16 +367,13 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			peerConnections[message.Id].mux.Lock()
 			if err = peerConnections[message.Id].SetLocalDescription(answer); err != nil {
-				peerConnections[message.Id].mux.Unlock()
 				log.Println(err)
 				return
 			}
-			peerConnections[message.Id].mux.Unlock()
 
 			// Отправляем локал дескрипшен, потому что в ансвере нет айс-кандидатов
-			answerString, err := json.Marshal(peerConnections[message.Id].LocalDescription())
+			answerString, err := json.Marshal(answer)
 			if err != nil {
 				return
 			}
@@ -392,13 +411,10 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				peerConnections[message.Id].mux.Lock()
 				if err = peerConnections[message.Id].SetLocalDescription(answer); err != nil {
-					peerConnections[message.Id].mux.Unlock()
 					log.Println(err)
 					return
 				}
-				peerConnections[message.Id].mux.Unlock()
 
 				answerString, err := json.Marshal(answer)
 				if err != nil {
